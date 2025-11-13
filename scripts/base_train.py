@@ -19,6 +19,7 @@ from contextlib import nullcontext
 import wandb
 import torch
 
+from nanochat.mamba import Mamba, MambaConfig
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
@@ -35,8 +36,15 @@ run = "dummy" # wandb run name default ("dummy" is special - we won't log to wan
 # Runtime
 device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 # Model architecture
+model_type = "gpt" # gpt|mamba - which architecture to use
 depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
 max_seq_len = 2048 # max context length
+# Mamba-specific hyperparameters
+d_state = 128 # Mamba: SSM state dimension
+d_conv = 4 # Mamba: convolution kernel size
+expand = 2 # Mamba: expansion factor
+headdim = 64 # Mamba: head dimension
+chunk_size = 256 # Mamba: chunk size for SSD algorithm
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
@@ -105,17 +113,41 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
-model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
-with torch.device("meta"):
-    model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
+if model_type == "mamba":
+    print0("🐍 Using Mamba2 architecture!")
+    model_config_kwargs = dict(
+        vocab_size=vocab_size,
+        d_model=model_dim,
+        n_layer=num_layers,
+        d_state=d_state,
+        d_conv=d_conv,
+        expand=expand,
+        headdim=headdim,
+        chunk_size=chunk_size,
+    )
+    with torch.device("meta"):
+        model_config = MambaConfig(**model_config_kwargs)
+        model = Mamba(model_config)
+else:
+    print0("🤖 Using Transformer (GPT) architecture")
+    model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+    with torch.device("meta"):
+        model_config = GPTConfig(**model_config_kwargs)
+        model = GPT(model_config)
+
 model.to_empty(device=device)
 model.init_weights()
 orig_model = model # original, uncompiled model, for saving raw model state_dict
 model = torch.compile(model, dynamic=False) # TODO: dynamic True/False think through
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
-num_flops_per_token = model.estimate_flops()
+
+# Estimate FLOPs (use GPT's estimate method if available, otherwise rough Mamba estimate)
+if hasattr(model, 'estimate_flops'):
+    num_flops_per_token = model.estimate_flops()
+else:
+    # Rough Mamba FLOPs estimate: ~6*D*L per token (linear vs quadratic)
+    num_flops_per_token = 6 * model_dim * num_layers
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 # Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)
@@ -140,8 +172,15 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
-optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
-adamw_optimizer, muon_optimizer = optimizers
+if model_type == "mamba":
+    # Mamba uses its own optimizer setup
+    optimizers = orig_model.configure_optimizers(weight_decay, embedding_lr, (0.9, 0.95), device_type)
+    adamw_optimizer = optimizers
+    muon_optimizer = None
+    optimizers = [adamw_optimizer] if not isinstance(adamw_optimizer, list) else adamw_optimizer
+else:
+    optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
+    adamw_optimizer, muon_optimizer = optimizers
 
 # Initialize the DataLoaders for train/val
 base_dir = get_base_dir()
@@ -165,7 +204,7 @@ def get_lr_multiplier(it):
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * final_lr_frac
 
-# Momentum scheduler for Muon optimizer
+# Momentum scheduler for Muon optimizer (only used for GPT)
 def get_muon_momentum(it):
     frac = min(it / 300, 1)
     momentum = (1 - frac) * 0.85 + frac * 0.95
@@ -281,9 +320,10 @@ for step in range(num_iterations + 1):
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * lrm
-    muon_momentum = get_muon_momentum(step)
-    for group in muon_optimizer.param_groups:
-        group["momentum"] = muon_momentum
+    if muon_optimizer is not None:
+        muon_momentum = get_muon_momentum(step)
+        for group in muon_optimizer.param_groups:
+            group["momentum"] = muon_momentum
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
